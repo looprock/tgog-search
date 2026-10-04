@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcript Search</title>
+<style>
+  :root { --bg:#14161a; --card:#1d2026; --muted:#8b93a1; --fg:#e7eaf0;
+          --accent:#ff6b6b; --hit:#6b2a2a; --line:#2a2e36; --moment:#171a1f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { position:sticky; top:0; z-index:10; background:var(--bg);
+           border-bottom:1px solid var(--line); padding:14px 20px 12px; }
+  h1 { margin:0 0 10px; font-size:18px; font-weight:600; }
+  h1 small { color:var(--muted); font-weight:400; font-size:13px; margin-left:8px; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  #q { flex:1 1 320px; min-width:220px; padding:10px 12px; font-size:15px;
+       background:var(--card); border:1px solid var(--line); border-radius:8px;
+       color:var(--fg); }
+  #q:focus { outline:none; border-color:var(--accent); }
+  select { padding:9px 10px; background:var(--card); border:1px solid var(--line);
+           border-radius:8px; color:var(--fg); font-size:14px; }
+  label.chk { color:var(--muted); font-size:13px; display:flex; gap:5px; align-items:center; cursor:pointer; }
+  .count { color:var(--muted); font-size:13px; padding:8px 20px 0; }
+  .hint { color:var(--muted); font-size:12px; margin-top:6px; }
+  main { padding:14px 20px 60px; display:grid; gap:12px; max-width:1100px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .top { display:flex; gap:12px; }
+  .top img { width:160px; height:90px; border-radius:6px; flex:0 0 160px;
+             background:#000; object-fit:cover; }
+  .top .body { min-width:0; }
+  .card h2 { margin:0 0 2px; font-size:15px; line-height:1.3; }
+  .card h2 a { color:var(--fg); text-decoration:none; }
+  .card h2 a:hover { color:var(--accent); }
+  .meta { color:var(--muted); font-size:12px; margin-bottom:6px; }
+  .meta b { color:var(--accent); font-weight:600; }
+  .desc { font-size:13px; color:#cdd2db; max-height:4.5em; overflow:hidden; }
+  .moments { margin-top:10px; display:grid; gap:6px; }
+  .moment { display:flex; gap:10px; background:var(--moment); border:1px solid var(--line);
+            border-radius:7px; padding:7px 10px; font-size:13px; color:#cdd2db; }
+  .moment a.ts { flex:0 0 auto; color:var(--accent); text-decoration:none;
+                 font-variant-numeric:tabular-nums; font-weight:600; white-space:nowrap; }
+  .moment a.ts:hover { text-decoration:underline; }
+  button.more { background:none; border:1px solid var(--line); color:var(--muted);
+                border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer;
+                justify-self:start; }
+  button.more:hover { color:var(--fg); border-color:var(--muted); }
+  mark { background:var(--hit); color:#fff; border-radius:2px; padding:0 1px; }
+  .empty { color:var(--muted); padding:40px 20px; text-align:center; }
+  @media (max-width:600px) {
+    header, main { padding-left:16px; padding-right:16px; }
+    .count { padding-left:16px; }
+    .top img { width:110px; height:62px; flex-basis:110px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Transcript Search <small id="subtitle">loading transcripts…</small></h1>
+  <div class="controls">
+    <input id="q" type="search" autofocus
+           placeholder='Search what was said… (e.g. poltergeist, "lizzie borden", ouija board)'>
+    <select id="year"><option value="">All years</option></select>
+    <select id="sort">
+      <option value="relevance">Sort: relevance</option>
+      <option value="mentions">Most mentions</option>
+      <option value="date-desc">Newest</option>
+      <option value="date-asc">Oldest</option>
+      <option value="views">Most viewed</option>
+    </select>
+    <label class="chk"><input id="whole" type="checkbox"> whole words</label>
+  </div>
+  <div class="hint">All words must appear in the episode. Use "quotes" for exact phrases.
+    Timestamps open YouTube at that moment.</div>
+</header>
+<div class="count" id="count"></div>
+<main id="results"></main>
+
+<script src="transcripts-data.js"></script>
+<script>
+const PAGE = 60;            // cards rendered per "show more"
+const MOMENTS_SHOWN = 3;    // moments per card before expanding
+const MAX_POS = 4000;       // per-term, per-video positions mapped to segments
+const CLUSTER_SECS = 30;    // hits within this window merge into one moment
+
+const $ = id => document.getElementById(id);
+const $q = $('q'), $year = $('year'), $sort = $('sort'), $whole = $('whole'),
+      $results = $('results'), $count = $('count');
+
+// Lowercase without changing string length, so offsets stay aligned with the original.
+function lowerSameLength(s) {
+  const low = s.toLowerCase();
+  if (low.length === s.length) return low;
+  let out = '';
+  for (const ch of s) { const l = ch.toLowerCase(); out += l.length === ch.length ? l : ch; }
+  return out;
+}
+
+const VIDEOS = (window.VIDEOS || []).map(v => {
+  const offs = [0];
+  for (let i = v.x.indexOf('\n'); i >= 0; i = v.x.indexOf('\n', i + 1)) offs.push(i + 1);
+  return { ...v, lx: lowerSameLength(v.x), lmeta: (v.t + '\n' + v.desc + '\n' + v.tags.join(' ')).toLowerCase(),
+           offs: Int32Array.from(offs), year: v.d.slice(0, 4) };
+});
+
+const channels = [...new Set(VIDEOS.map(v => v.c).filter(Boolean))];
+if (channels.length === 1) {
+  $('title').firstChild.textContent = channels[0] + ' — Transcript Search ';
+  document.title = channels[0] + ' Transcript Search';
+}
+const totalHours = VIDEOS.reduce((s, v) => s + v.s, 0) / 3600;
+$('subtitle').textContent =
+  `${VIDEOS.length.toLocaleString()} episodes · ${Math.round(totalHours).toLocaleString()} hours of speech`;
+
+for (const y of [...new Set(VIDEOS.map(v => v.year))].sort().reverse()) {
+  const o = document.createElement('option'); o.value = y; o.textContent = y; $year.appendChild(o);
+}
+
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const fmtTime = s => {
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+};
+const ytUrl = (id, t) => `https://www.youtube.com/watch?v=${id}` + (t != null ? `&t=${t}s` : '');
+
+// Split a query into lowercase terms; "quoted phrases" stay whole, 1-char bare words are dropped.
+function parseQuery(raw) {
+  const terms = [];
+  raw.toLowerCase().replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
+     .replace(/"([^"]+)"|(\S+)/g, (_, phrase, word) => {
+       const t = (phrase || word || '').trim().replace(/\s+/g, ' ');
+       if (t && (phrase || t.length > 1)) terms.push(t);
+     });
+  return [...new Set(terms)];
+}
+
+function termRegex(term, whole) {
+  const body = reEsc(term).replace(/ /g, '\\s+');
+  return whole ? new RegExp(`(?<![\\p{L}\\p{N}])${body}(?![\\p{L}\\p{N}])`, 'gu') : new RegExp(body, 'g');
+}
+
+// Index of the segment containing character offset pos.
+function segAt(offs, pos) {
+  let lo = 0, hi = offs.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (offs[mid] <= pos) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+
+// Match one video against all terms; null if any term is missing everywhere.
+function matchVideo(v, regexes) {
+  const segHits = new Map();   // segment index -> Set of term indexes
+  let mentions = 0, metaHits = 0;
+  for (let ti = 0; ti < regexes.length; ti++) {
+    const re = regexes[ti];
+    re.lastIndex = 0;
+    const inMeta = re.test(v.lmeta);
+    re.lastIndex = 0;
+    let n = 0, m;
+    while ((m = re.exec(v.lx))) {
+      if (n < MAX_POS) {
+        const si = segAt(v.offs, m.index);
+        (segHits.get(si) || segHits.set(si, new Set()).get(si)).add(ti);
+      }
+      n++;
+    }
+    if (!n && !inMeta) return null;
+    mentions += n;
+    if (inMeta) metaHits++;
+  }
+  return { v, mentions, metaHits, moments: buildMoments(v, segHits) };
+}
+
+// Merge nearby hit segments into moments, scored by distinct terms then hit count.
+function buildMoments(v, segHits) {
+  const moments = [];
+  for (const si of [...segHits.keys()].sort((a, b) => a - b)) {
+    const last = moments[moments.length - 1];
+    if (last && v.o[si] - v.o[last.end] <= CLUSTER_SECS) {
+      last.end = si; last.hits++; segHits.get(si).forEach(t => last.terms.add(t));
+    } else {
+      moments.push({ start: si, end: si, hits: 1, terms: new Set(segHits.get(si)) });
+    }
+  }
+  return moments;
+}
+
+const segText = (v, i) => v.x.slice(v.offs[i], i + 1 < v.offs.length ? v.offs[i + 1] - 1 : v.x.length);
+
+function highlight(text, regexes) {
+  if (!regexes.length) return esc(text);
+  const ranges = [];
+  const low = lowerSameLength(text);
+  for (const re of regexes) {
+    re.lastIndex = 0; let m;
+    while ((m = re.exec(low))) ranges.push([m.index, m.index + m[0].length]);
+  }
+  ranges.sort((a, b) => a[0] - b[0]);
+  let out = '', pos = 0;
+  for (const [s, e] of ranges) {
+    if (s < pos) continue;
+    out += esc(text.slice(pos, s)) + '<mark>' + esc(text.slice(s, e)) + '</mark>';
+    pos = e;
+  }
+  return out + esc(text.slice(pos));
+}
+
+// Context for a moment: neighbouring segments, trimmed around the first match.
+function momentHtml(v, mo, regexes) {
+  const from = Math.max(0, mo.start - 1), to = Math.min(v.offs.length - 1, mo.end + 1);
+  let text = [];
+  for (let i = from; i <= to; i++) text.push(segText(v, i));
+  text = text.join(' ');
+  const low = lowerSameLength(text);
+  let first = -1;
+  for (const re of regexes) { re.lastIndex = 0; const m = re.exec(low); if (m && (first < 0 || m.index < first)) first = m.index; }
+  const LEN = 420;
+  if (text.length > LEN) {
+    const s = Math.max(0, Math.min(first - 140, text.length - LEN));
+    text = (s > 0 ? '…' : '') + text.slice(s, s + LEN) + (s + LEN < text.length ? '…' : '');
+  }
+  const t = Math.max(0, v.o[mo.start] - 2);
+  return `<div class="moment"><a class="ts" href="${ytUrl(v.id, t)}" target="_blank" rel="noopener">▶ ${fmtTime(v.o[mo.start])}</a>
+          <div>${highlight(text, regexes)}</div></div>`;
+}
+
+let current = [], shown = 0, curRegexes = [];
+
+function cardHtml(r, idx) {
+  const { v } = r;
+  const moments = r.moments || [];
+  const best = [...moments].sort((a, b) => b.terms.size - a.terms.size || b.hits - a.hits)
+                           .slice(0, MOMENTS_SHOWN).sort((a, b) => a.start - b.start);
+  const statLine = curRegexes.length
+    ? ` · <b>${r.mentions.toLocaleString()} mention${r.mentions === 1 ? '' : 's'}</b>` +
+      (moments.length ? ` in ${moments.length} moment${moments.length === 1 ? '' : 's'}` : ' (title/description only)')
+    : '';
+  const desc = curRegexes.length && moments.length ? '' :
+    `<div class="desc">${highlight(v.desc.slice(0, 400), curRegexes)}</div>`;
+  return `<div class="card">
+    <div class="top">
+      <a href="${ytUrl(v.id)}" target="_blank" rel="noopener"><img loading="lazy" src="https://i.ytimg.com/vi/${v.id}/mqdefault.jpg" alt=""></a>
+      <div class="body">
+        <h2><a href="${ytUrl(v.id)}" target="_blank" rel="noopener">${highlight(v.t, curRegexes)}</a></h2>
+        <div class="meta">${v.d} · ${fmtTime(v.s)} · ${v.v.toLocaleString()} views${statLine}</div>
+        ${desc}
+      </div>
+    </div>
+    ${best.length ? `<div class="moments" id="m${idx}">${best.map(mo => momentHtml(v, mo, curRegexes)).join('')}
+      ${moments.length > best.length ? `<button class="more" data-idx="${idx}">Show all ${moments.length} moments</button>` : ''}</div>` : ''}
+  </div>`;
+}
+
+function renderPage() {
+  const next = current.slice(shown, shown + PAGE);
+  document.getElementById('loadmore')?.remove();
+  $results.insertAdjacentHTML('beforeend', next.map((r, i) => cardHtml(r, shown + i)).join(''));
+  shown += next.length;
+  if (shown < current.length)
+    $results.insertAdjacentHTML('beforeend',
+      `<button class="more" id="loadmore">Show more (${(current.length - shown).toLocaleString()} left)</button>`);
+}
+
+$results.addEventListener('click', e => {
+  const b = e.target.closest('button.more');
+  if (!b) return;
+  if (b.id === 'loadmore') return renderPage();
+  const idx = +b.dataset.idx, r = current[idx];
+  $('m' + idx).innerHTML = r.moments.map(mo => momentHtml(r.v, mo, curRegexes)).join('');
+});
+
+function search() {
+  const terms = parseQuery($q.value);
+  const regexes = terms.map(t => termRegex(t, $whole.checked));
+  const year = $year.value;
+  const pool = year ? VIDEOS.filter(v => v.year === year) : VIDEOS;
+
+  const t0 = performance.now();
+  let hits = terms.length ? pool.map(v => matchVideo(v, regexes)).filter(Boolean)
+                          : pool.map(v => ({ v, mentions: 0, metaHits: 0, moments: [] }));
+  const ms = Math.round(performance.now() - t0);
+
+  const sort = $sort.value;
+  const score = r => r.metaHits * 40 + Math.log1p(r.mentions) * 10 +
+                     Math.max(0, ...r.moments.map(m => m.terms.size)) * 15;
+  if (sort === 'relevance' && terms.length) hits.sort((a, b) => score(b) - score(a));
+  else if (sort === 'mentions') hits.sort((a, b) => b.mentions - a.mentions);
+  else if (sort === 'date-asc') hits.sort((a, b) => a.v.d.localeCompare(b.v.d));
+  else if (sort === 'views') hits.sort((a, b) => b.v.v - a.v.v);
+  else hits.sort((a, b) => b.v.d.localeCompare(a.v.d));
+
+  const total = hits.reduce((s, r) => s + r.mentions, 0);
+  $count.textContent = terms.length
+    ? `${hits.length.toLocaleString()} episode${hits.length === 1 ? '' : 's'} · ${total.toLocaleString()} mentions · ${ms} ms`
+    : `${hits.length.toLocaleString()} episodes`;
+
+  current = hits; shown = 0; curRegexes = regexes;
+  $results.innerHTML = hits.length ? '' : '<div class="empty">No matches. Try fewer or different words.</div>';
+  renderPage();
+  saveHash();
+}
+
+// Keep the search in the URL so it can be bookmarked or shared.
+function saveHash() {
+  const p = new URLSearchParams();
+  if ($q.value.trim()) p.set('q', $q.value.trim());
+  if ($year.value) p.set('y', $year.value);
+  if ($sort.value !== 'relevance') p.set('s', $sort.value);
+  if ($whole.checked) p.set('w', '1');
+  history.replaceState(null, '', p.toString() ? '#' + p : location.pathname);
+}
+function loadHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  $q.value = p.get('q') || '';
+  $year.value = p.get('y') || '';
+  $sort.value = p.get('s') || 'relevance';
+  $whole.checked = p.get('w') === '1';
+}
+
+let timer;
+$q.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(search, 200); });
+[$year, $sort, $whole].forEach(el => el.addEventListener('change', search));
+window.addEventListener('hashchange', () => { loadHash(); search(); });
+loadHash();
+search();
+</script>
+</body>
+</html>
